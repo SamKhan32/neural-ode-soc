@@ -19,7 +19,7 @@ device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
 
 def load_checkpoint():
-    checkpoint = torch.load("data/processed/checkpoint.pt", map_location=device)
+    checkpoint = torch.load("data/processed/checkpoint.pt", map_location=device, weights_only=False)
 
     odefunc = ODEFunc(latent_dim=2, input_dim=3).to(device)
     encoder = nn.Linear(3, 2).to(device)
@@ -64,7 +64,7 @@ def predict_node(df, odefunc, encoder, decoder):
     with torch.no_grad():
         z_t = odeint(odefunc, z0, t, method="dopri5", rtol=1e-3, atol=1e-3)
 
-    soc_pred = decoder(z_t).squeeze().cpu().numpy()
+    soc_pred = decoder(z_t).squeeze().detach().cpu().numpy()
     return soc_pred
 
 
@@ -137,13 +137,13 @@ def main():
     cycle_dfs = load_cycles()
     cycle_dfs = remove_relaxation(cycle_dfs)
     train_cycles, val_cycles, test_cycles = split_cycles(cycle_dfs)
+    raw_test_cycles = test_cycles.copy()
 
     # normalize using training stats
     stats = compute_norm_stats(train_cycles)
     train_cycles = normalize_cycles(train_cycles, stats)
     val_cycles   = normalize_cycles(val_cycles,   stats)
     test_cycles  = normalize_cycles(test_cycles,  stats)
-
     print("Loading models...")
     odefunc, encoder, decoder, _ = load_checkpoint()
     ocv_lookup = load_ocv_lookup()
@@ -153,12 +153,12 @@ def main():
     coulomb_maes  = []
     ocv_maes      = []
 
-    for i, df in enumerate(test_cycles):
+    for i, (df, raw_df) in enumerate(zip(test_cycles, raw_test_cycles)):
         t_sub    = df["time_s"].values[::20]
         soc_true = df["soc"].values[::20]
 
         soc_node    = predict_node(df, odefunc, encoder, decoder)
-        soc_coulomb = predict_coulomb(df)[::20]
+        soc_coulomb = predict_coulomb(raw_df)[::20]
         soc_ocv     = predict_ocv(df, ocv_lookup)[::20]
 
         node_maes.append(compute_mae(soc_node, soc_true))
@@ -174,8 +174,9 @@ def main():
     # plot a few individual cycles — early, mid, late test set
     for cycle_num in [0, len(test_cycles)//2, len(test_cycles)-1]:
         df = test_cycles[cycle_num]
+        raw_df = raw_test_cycles[cycle_num]
         soc_node    = predict_node(df, odefunc, encoder, decoder)
-        soc_coulomb = predict_coulomb(df)
+        soc_coulomb = predict_coulomb(raw_df)
         soc_ocv     = predict_ocv(df, ocv_lookup)
         plot_single_cycle(df, soc_node, soc_coulomb, soc_ocv, cycle_num)
 
