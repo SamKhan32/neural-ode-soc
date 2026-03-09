@@ -1,4 +1,5 @@
 # NeuralODE.py
+#
 # Defines the PyTorch model architecture for predicting battery state of charge (SoC) from voltage and current.
 # Uses a neural ordinary differential equation (ODE) approach, where the model learns a continuous-time representation of the battery dynamics.
 
