@@ -15,6 +15,7 @@ from torchdiffeq import odeint # for solving the ODE during training
 from baselines import coulomb_counting, fit_ocv_lookup, ocv_lookup_predict # baseline models for comparison
 import time
 import matplotlib.pyplot as plt
+import pickle
 
 # global variables
 LEARNING_RATE = 1e-3
@@ -41,13 +42,17 @@ def train_neural_ode(train_cycles, val_cycles):
         encoder.train()
         decoder.train()
 
-        for df in train_cycles:
+        for idx, df in enumerate(train_cycles):
             optimizer.zero_grad()
-
+         
             # build tensors for this cycle
             t = torch.tensor(df["time_s"].values, dtype=torch.float32)
             x = torch.tensor(df[["voltage_V", "current_A", "temperature_C"]].values, dtype=torch.float32)
             y = torch.tensor(df["soc"].values, dtype=torch.float32)
+            # subsample every 20 timesteps
+            t = t[::20]
+            x = x[::20]
+            y = y[::20]
             # normalize time to start at 0, and to be between 0 and 1
             t = t - t[0]
             t = t / t[-1]  # normalize to [0, 1]
@@ -63,8 +68,7 @@ def train_neural_ode(train_cycles, val_cycles):
             z0 = encoder(x[0])
 
             # integrate latent state forward through time
-            z_t = odeint(odefunc, z0, t, method="dopri5")  # [T, latent_dim]
-
+            z_t = odeint(odefunc, z0, t, method="dopri5", rtol=1e-3, atol=1e-3) # [T, latent_dim]
             # decode to SOC
             soc_pred = decoder(z_t).squeeze()  # [T]
 
@@ -84,7 +88,8 @@ def train_neural_ode(train_cycles, val_cycles):
     plt.yscale("log")
     plt.xlabel("Epoch")
     plt.ylabel("MSE Loss (log scale)")
-    plt.title("Training Loss — Neural ODE")
+    plt.title("Training Loss - Neural ODE")
+    plt.xticks(range(EPOCHS))
     plt.tight_layout()
     plt.savefig("figures/training_loss.png", dpi=150)
     plt.show()
@@ -119,5 +124,10 @@ def main():
     # save models
     torch.save({"odefunc": odefunc.state_dict(),"encoder": encoder.state_dict(),"decoder": decoder.state_dict(),"stats":   stats,}, "data/processed/checkpoint.pt")
     print("checkpoint saved")
+    # "fit" the ocv-soc lookup table on train
+    ocv_lookup = fit_ocv_lookup(train_cycles)
+    with open("data/processed/ocv_lookup.pkl", "wb") as f:
+        pickle.dump(ocv_lookup, f)
+
 if __name__ == "__main__":
     main()
