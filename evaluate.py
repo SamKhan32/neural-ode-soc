@@ -98,8 +98,8 @@ def plot_single_cycle(df, soc_node, soc_coulomb, soc_ocv, cycle_num, save=True):
 
     ax.plot(t, soc_true,     color="black",      linewidth=2,   label="Ground Truth (Coulomb)")
     ax.plot(t, soc_node,     color="steelblue",  linewidth=1.5, label="Neural ODE",   linestyle="--")
-    ax.plot(t, soc_coulomb[::20], color="firebrick",  linewidth=1.5, label="Coulomb Counting", linestyle=":")
-    ax.plot(t, soc_ocv[::20],     color="darkorange", linewidth=1.5, label="OCV Lookup",       linestyle="-.")
+    ax.plot(t, soc_coulomb, color="firebrick",  linewidth=1.5, label="Coulomb Counting", linestyle=":")
+    ax.plot(t, soc_ocv,     color="darkorange", linewidth=1.5, label="OCV Lookup",       linestyle="-.")
 
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("SOC")
