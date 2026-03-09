@@ -19,6 +19,8 @@ BATCH_SIZE = 64
 LEARNING_RATE = 1e-3
 EPOCHS = 20
 
+def train_neural_ode(train_cycles, val_cycles):
+    # 
 
 
 
@@ -37,7 +39,6 @@ def main():
     train_cycles = normalize_cycles(train_cycles, stats)
     val_cycles = normalize_cycles(val_cycles, stats)
     test_cycles = normalize_cycles(test_cycles, stats)
-    # prepare training data for Neural ODE
 
 if __name__ == "__main__":
     main()
