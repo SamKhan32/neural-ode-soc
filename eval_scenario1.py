@@ -1,14 +1,23 @@
 # evaluate_scenario.py
 #
-# Visualizes the core failure mode of Coulomb counting: sensitivity to the
-# initial SOC estimate. CC is a pure integrator, so a wrong starting value
-# produces a persistent offset that never corrects itself across the discharge.
-# The Neural ODE sidesteps this by inferring z0 from the first observed signal
-# rather than relying on a user-supplied scalar.
+# Two scenarios that expose real failure modes of Coulomb counting, each with
+# a corresponding Neural ODE comparison.
 #
-# Generates two figures:
-#   scenario_fixed_offset.png  -- CC with a fixed bad init vs. Neural ODE
-#   scenario_noise_sweep.png   -- CC uncertainty band across N noisy inits
+# Scenario A — bad initial SOC (perturbed z0):
+#   Both CC and the Neural ODE are given the same wrong initial state.
+#   CC integrates forward from that error with no way to recover. The Neural
+#   ODE has signal feedback through the ODE dynamics, so the latent state gets
+#   pulled back toward the true trajectory as the discharge progresses.
+#   The z0 perturbation is computed analytically: since the decoder is a single
+#   linear layer, we can solve exactly for the delta that shifts the initial
+#   decoded SOC by CC_INIT_OFFSET, making the comparison apples-to-apples.
+#
+# Scenario B — capacity fade (stale nominal capacity):
+#   In a deployed BMS, the CC capacity parameter is set at manufacture and
+#   rarely updated. As the cell ages, true capacity fades, so CC systematically
+#   overestimates remaining SOC late in life. The Neural ODE learned from the
+#   voltage/current signal shape, not the nominal capacity, so it degrades more
+#   gracefully across the aging test set.
 #
 # Run after train.py:
 #   python evaluate_scenario.py
@@ -25,15 +34,11 @@ from baselines import coulomb_counting
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-# which test cycle to visualize: "early", "mid", "late", or an integer index
+# which test cycle to use for scenario A: "early", "mid", "late", or an int
 SCENARIO_CYCLE_IDX = "mid"
 
-# how far off is the bad soc_init in figure 1 (subtracted from true init)
+# how far off the initial SOC estimate is in scenario A
 CC_INIT_OFFSET = 0.15
-
-# sigma levels for the noise sweep in figure 2
-NOISE_SIGMAS = [0.05, 0.10, 0.20]
-N_SAMPLES = 100
 
 
 def load_checkpoint():
@@ -50,23 +55,38 @@ def load_checkpoint():
     return odefunc, encoder, decoder
 
 
-def predict_node(df, odefunc, encoder, decoder):
+def predict_node(df, odefunc, encoder, decoder, z0_override=None):
     t = torch.tensor(df["time_s"].values, dtype=torch.float32)[::20]
     x = torch.tensor(df[["voltage_V", "current_A", "temperature_C"]].values, dtype=torch.float32)[::20]
     t = (t - t[0]) / (t[-1] - t[0])
     t, x = t.to(device), x.to(device)
     odefunc.set_interpolator(t.cpu().numpy(), x.cpu().numpy())
-    z0 = encoder(x[0])
+    z0 = z0_override if z0_override is not None else encoder(x[0])
     with torch.no_grad():
         z_t = odeint(odefunc, z0, t, method="dopri5", rtol=1e-3, atol=1e-3)
     return decoder(z_t).squeeze().detach().cpu().numpy()
 
 
-def predict_coulomb_with_init(raw_df, soc_init):
+def perturb_z0(df, encoder, decoder, soc_offset):
+    # find the delta in latent space that shifts the decoded initial SOC by soc_offset
+    # decoder is Linear(2->1): soc = w @ z + b, so d(soc)/dz = w
+    # we want decoder(z0 + delta) = decoder(z0) + soc_offset
+    # => w @ delta = soc_offset => delta = soc_offset * w^T / ||w||^2
+    x0 = torch.tensor(
+        df[["voltage_V", "current_A", "temperature_C"]].values[0],
+        dtype=torch.float32
+    ).to(device)
+    z0 = encoder(x0)
+    w = decoder.weight[0]  # shape [latent_dim]
+    delta = soc_offset * w / (w @ w)
+    return (z0 + delta).detach()
+
+
+def predict_coulomb(raw_df, capacity_Ah, soc_init=1.0):
     return coulomb_counting(
         raw_df["time_s"].values,
         raw_df["current_A"].values,
-        raw_df["capacity_Ah"].iloc[0],
+        capacity_Ah,
         soc_init=soc_init,
     )[::20]
 
@@ -78,69 +98,82 @@ def resolve_cycle_idx(test_cycles, key):
     return {"early": 0, "mid": n // 2, "late": n - 1}[key]
 
 
-def plot_fixed_offset(t_sub, soc_true, soc_node, soc_cc_correct, soc_cc_offset, offset, save=True):
+def compute_mae(pred, true):
+    return np.mean(np.abs(pred - true))
+
+
+def plot_scenario_a(t_sub, soc_true, soc_node_perturbed, soc_cc_offset, offset, save=True):
+    # three curves only: ground truth, CC with bad init, NODE with same bad init
+    # keeping the "correct init" references out avoids distracting from the main point
     fig, ax = plt.subplots(figsize=(11, 5))
 
-    ax.plot(t_sub, soc_true,       color="black",     linewidth=2.0, label="Ground Truth")
-    ax.plot(t_sub, soc_node,       color="steelblue", linewidth=1.8, label="Neural ODE (init inferred from signal)", linestyle="--")
-    ax.plot(t_sub, soc_cc_correct, color="gray",      linewidth=1.0, label="Coulomb Counting (correct init)", linestyle=":", alpha=0.5)
-    ax.plot(t_sub, soc_cc_offset,  color="firebrick", linewidth=1.8, label=f"Coulomb Counting (init − {offset:.2f})", linestyle=":")
+    ax.plot(t_sub, soc_true,           color="black",     linewidth=2.0, label="Ground Truth")
+    ax.plot(t_sub, soc_cc_offset,      color="firebrick", linewidth=1.8, label=f"Coulomb Counting (init − {offset:.2f})", linestyle=":")
+    ax.plot(t_sub, soc_node_perturbed, color="steelblue", linewidth=1.8, label=f"Neural ODE (init − {offset:.2f})", linestyle="--")
 
-    # show that the error at the end of the cycle is the same as at the start
-    gap = abs(soc_cc_offset[-1] - soc_true[-1])
+    cc_gap   = abs(soc_cc_offset[-1]      - soc_true[-1])
+    node_gap = abs(soc_node_perturbed[-1] - soc_true[-1])
+
     ax.annotate(
-        f"error = {gap:.3f}\n(never corrects)",
+        f"final error = {cc_gap:.3f}",
         xy=(t_sub[-1], soc_cc_offset[-1]),
-        xytext=(t_sub[-1] * 0.75, soc_cc_offset[-1] + 0.05),
+        xytext=(t_sub[-1] * 0.70, soc_cc_offset[-1] - 0.08),
         arrowprops=dict(arrowstyle="->", color="firebrick"),
-        color="firebrick",
-        fontsize=9,
+        color="firebrick", fontsize=9,
+    )
+    ax.annotate(
+        f"final error = {node_gap:.3f}",
+        xy=(t_sub[-1], soc_node_perturbed[-1]),
+        xytext=(t_sub[-1] * 0.70, soc_node_perturbed[-1] + 0.06),
+        arrowprops=dict(arrowstyle="->", color="steelblue"),
+        color="steelblue", fontsize=9,
     )
 
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("SOC")
-    ax.set_ylim(-0.05, 1.10)
+    ax.set_ylim(-0.05, 1.15)
     ax.set_title(
-        "SOC Estimation — Sensitivity to Initial Condition\n"
-        "A bad soc_init offsets Coulomb counting for the entire discharge; Neural ODE is unaffected"
+        f"Scenario A — both methods start with soc_init − {offset:.2f}\n"
+        "Coulomb counting carries the error forward; Neural ODE pulls back toward ground truth"
     )
-    ax.legend(loc="upper right")
+    ax.legend(loc="upper right", fontsize=9)
     plt.tight_layout()
     if save:
-        plt.savefig("figures/scenario_fixed_offset.png", dpi=150)
-        print("saved: figures/scenario_fixed_offset.png")
+        plt.savefig("figures/scenario_a_bad_init.png", dpi=150)
+        print("saved: figures/scenario_a_bad_init.png")
     plt.show()
 
 
-def plot_noise_sweep(t_sub, soc_true, soc_node, raw_df, true_init, sigmas, n_samples, save=True):
-    # three shades of red, one per sigma level, drawn widest-first so narrow bands aren't hidden
-    band_colors = ["#f4a582", "#d6604d", "#b2182b"]
+def plot_scenario_b(test_cycle_indices, node_maes, cc_true_maes, cc_stale_maes, capacity_fade_pct, save=True):
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
 
-    fig, ax = plt.subplots(figsize=(11, 5))
+    # left: MAE over aging
+    ax = axes[0]
+    ax.plot(test_cycle_indices, cc_stale_maes, color="firebrick", linewidth=1.8, label="Coulomb Counting (stale capacity)", linestyle=":")
+    ax.plot(test_cycle_indices, cc_true_maes,  color="gray",      linewidth=1.0, label="Coulomb Counting (true capacity)",  linestyle=":", alpha=0.5)
+    ax.plot(test_cycle_indices, node_maes,     color="steelblue", linewidth=1.8, label="Neural ODE", linestyle="--")
+    ax.set_xlabel("Test Cycle Index (older →)")
+    ax.set_ylabel("MAE")
+    ax.set_title("SOC Error Over Aging")
+    ax.legend(fontsize=8.5)
 
-    rng = np.random.default_rng(seed=42)
-    for sigma, color in zip(reversed(sigmas), reversed(band_colors)):
-        inits = np.clip(rng.normal(loc=true_init, scale=sigma, size=n_samples), 0.01, 1.0)
-        samples = np.stack([predict_coulomb_with_init(raw_df, s) for s in inits])
-        ax.fill_between(t_sub, samples.min(axis=0), samples.max(axis=0), color=color, alpha=0.25)
-        ax.plot(t_sub, samples.mean(axis=0), color=color, linewidth=1.2, linestyle=":",
-                label=f"CC  σ={sigma:.2f}  (n={n_samples})")
+    # right: capacity fade across the same test cycles
+    ax = axes[1]
+    ax.plot(test_cycle_indices, capacity_fade_pct, color="darkorange", linewidth=1.8)
+    ax.set_xlabel("Test Cycle Index (older →)")
+    ax.set_ylabel("Capacity remaining (%)")
+    ax.set_title("True Cell Capacity Fade")
+    ax.set_ylim(0, 105)
 
-    ax.plot(t_sub, soc_true, color="black",     linewidth=2.0, label="Ground Truth")
-    ax.plot(t_sub, soc_node, color="steelblue", linewidth=1.8, label="Neural ODE (single prediction, no init required)", linestyle="--")
-
-    ax.set_xlabel("Time (s)")
-    ax.set_ylabel("SOC")
-    ax.set_ylim(-0.05, 1.10)
-    ax.set_title(
-        "SOC Estimation — Initialization Noise Robustness\n"
-        "CC uncertainty band widens with σ; Neural ODE produces one consistent curve"
+    fig.suptitle(
+        "Scenario B — Capacity Fade: CC uses a stale nominal capacity from training time\n"
+        "Neural ODE tracks the signal shape and degrades more gracefully",
+        fontsize=10,
     )
-    ax.legend(loc="upper right", fontsize=8.5)
     plt.tight_layout()
     if save:
-        plt.savefig("figures/scenario_noise_sweep.png", dpi=150)
-        print("saved: figures/scenario_noise_sweep.png")
+        plt.savefig("figures/scenario_b_capacity_fade.png", dpi=150)
+        print("saved: figures/scenario_b_capacity_fade.png")
     plt.show()
 
 
@@ -149,7 +182,8 @@ def main():
     cycle_dfs = load_cycles()
     cycle_dfs = remove_relaxation(cycle_dfs)
     train_cycles, val_cycles, test_cycles = split_cycles(cycle_dfs)
-    raw_test_cycles = test_cycles.copy()
+    raw_train_cycles = train_cycles.copy()
+    raw_test_cycles  = test_cycles.copy()
 
     stats = compute_norm_stats(train_cycles)
     train_cycles = normalize_cycles(train_cycles, stats)
@@ -159,31 +193,60 @@ def main():
     print("loading checkpoint...")
     odefunc, encoder, decoder = load_checkpoint()
 
-    idx = resolve_cycle_idx(test_cycles, SCENARIO_CYCLE_IDX)
+    # nominal capacity: mean over training cycles, representing what a BMS would
+    # have been calibrated to at the start of the cell's life
+    nominal_capacity = np.mean([df["capacity_Ah"].iloc[0] for df in raw_train_cycles])
+    print(f"nominal capacity (training mean): {nominal_capacity:.4f} Ah")
+
+    # scenario A
+    print("\nscenario A: bad initial SOC")
+    idx    = resolve_cycle_idx(test_cycles, SCENARIO_CYCLE_IDX)
     df     = test_cycles[idx]
     raw_df = raw_test_cycles[idx]
-    print(f"using test cycle {idx} ('{SCENARIO_CYCLE_IDX}')")
+    print(f"  using test cycle {idx} ('{SCENARIO_CYCLE_IDX}')")
 
     t_sub     = raw_df["time_s"].values[::20]
     soc_true  = df["soc"].values[::20]
     true_init = soc_true[0]
-    print(f"true initial SOC: {true_init:.3f}")
 
-    print("running Neural ODE inference...")
-    soc_node = predict_node(df, odefunc, encoder, decoder)
+    soc_node_clean     = predict_node(df, odefunc, encoder, decoder)
+    z0_bad             = perturb_z0(df, encoder, decoder, soc_offset=-CC_INIT_OFFSET)
+    soc_node_perturbed = predict_node(df, odefunc, encoder, decoder, z0_override=z0_bad)
+    soc_cc_correct     = predict_coulomb(raw_df, raw_df["capacity_Ah"].iloc[0], soc_init=true_init)
+    soc_cc_offset      = predict_coulomb(raw_df, raw_df["capacity_Ah"].iloc[0], soc_init=true_init - CC_INIT_OFFSET)
 
-    print("\nfigure 1: fixed offset")
-    soc_cc_correct = predict_coulomb_with_init(raw_df, soc_init=true_init)
-    soc_cc_offset  = predict_coulomb_with_init(raw_df, soc_init=true_init - CC_INIT_OFFSET)
-    print(f"  correct init:  {true_init:.3f}")
-    print(f"  offset init:   {true_init - CC_INIT_OFFSET:.3f}")
-    print(f"  final error — correct CC: {abs(soc_cc_correct[-1] - soc_true[-1]):.4f}")
-    print(f"  final error — offset  CC: {abs(soc_cc_offset[-1]  - soc_true[-1]):.4f}")
-    print(f"  final error — Neural ODE: {abs(soc_node[-1]       - soc_true[-1]):.4f}")
-    plot_fixed_offset(t_sub, soc_true, soc_node, soc_cc_correct, soc_cc_offset, CC_INIT_OFFSET)
+    print(f"  true init: {true_init:.3f}  |  perturbed init: {true_init - CC_INIT_OFFSET:.3f}")
+    print(f"  final error — CC (offset):       {abs(soc_cc_offset[-1]       - soc_true[-1]):.4f}")
+    print(f"  final error — NODE (perturbed):  {abs(soc_node_perturbed[-1]  - soc_true[-1]):.4f}")
+    plot_scenario_a(t_sub, soc_true, soc_node_perturbed, soc_cc_offset, CC_INIT_OFFSET)
 
-    print("\nfigure 2: noise sweep")
-    plot_noise_sweep(t_sub, soc_true, soc_node, raw_df, true_init, NOISE_SIGMAS, N_SAMPLES)
+    # scenario B
+    print("\nscenario B: capacity fade")
+    node_maes      = []
+    cc_true_maes   = []
+    cc_stale_maes  = []
+    capacities     = []
+    test_indices   = list(range(len(test_cycles)))
+
+    for df, raw_df in zip(test_cycles, raw_test_cycles):
+        soc_true = df["soc"].values[::20]
+        true_cap = raw_df["capacity_Ah"].iloc[0]
+        capacities.append(true_cap)
+
+        soc_node      = predict_node(df, odefunc, encoder, decoder)
+        soc_cc_true   = predict_coulomb(raw_df, true_cap,        soc_init=soc_true[0])
+        soc_cc_stale  = predict_coulomb(raw_df, nominal_capacity, soc_init=soc_true[0])
+
+        node_maes.append(compute_mae(soc_node,     soc_true))
+        cc_true_maes.append(compute_mae(soc_cc_true,  soc_true))
+        cc_stale_maes.append(compute_mae(soc_cc_stale, soc_true))
+
+    capacity_fade_pct = 100.0 * np.array(capacities) / capacities[0]
+    print(f"  capacity range: {min(capacities):.4f} – {max(capacities):.4f} Ah  ({capacity_fade_pct[-1]:.1f}% remaining at end)")
+    print(f"  mean MAE — NODE:        {np.mean(node_maes):.4f}")
+    print(f"  mean MAE — CC (true):   {np.mean(cc_true_maes):.4f}")
+    print(f"  mean MAE — CC (stale):  {np.mean(cc_stale_maes):.4f}")
+    plot_scenario_b(test_indices, node_maes, cc_true_maes, cc_stale_maes, capacity_fade_pct)
 
     print("\ndone.")
 
