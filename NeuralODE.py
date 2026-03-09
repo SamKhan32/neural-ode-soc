@@ -32,7 +32,8 @@ class ODEFunc(nn.Module):
         self.interpolator = interp1d(t_np, x_np, axis=0,bounds_error=False, fill_value="extrapolate")
 
     def forward(self, t, z):
-        # look up input features at current time t (scalar)
-        x_t = torch.tensor(self.interpolator(t.item()), dtype=torch.float32)
+        x_t = torch.tensor(
+            self.interpolator(t.item()), dtype=torch.float32
+        ).to(z.device)  # match device of z
         inp = torch.cat([z, x_t])
         return self.net(inp)
