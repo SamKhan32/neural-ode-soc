@@ -1,2 +1,5 @@
-data/processed
-data/raw
+data/raw/
+data/processed/
+soc-environment/
+__pycache__/
+*.pyc
