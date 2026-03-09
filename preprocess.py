@@ -1,8 +1,9 @@
 # preprocess.py
 #
+# This file contains functions that are ran during train.py to load and preprocess the raw discharge cycle data for B0005.
 # Loads raw discharge cycles for B0005, removes relaxation rows, splits into
 # train/val/test by cycle index, and computes normalization statistics from
-# training data only. Run this once before training to generate norm_stats.npy, which is used during train.py and test.py.
+# training data only. 
 #
 # Split is chronological - early (healthy) cycles are training, late (degraded)
 # cycles are test. This simulates real deployment where you train on a fresh
