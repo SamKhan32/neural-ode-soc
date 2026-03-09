@@ -63,6 +63,7 @@ def train_neural_ode(train_cycles, val_cycles):
 
         avg_loss = total_loss / len(train_cycles)
         print(f"epoch {epoch+1}/{EPOCHS} — train loss: {avg_loss:.6f}")
+    return odefunc, encoder, decoder
 
         
 
@@ -83,6 +84,7 @@ def main():
     train_cycles = normalize_cycles(train_cycles, stats)
     val_cycles = normalize_cycles(val_cycles, stats)
     test_cycles = normalize_cycles(test_cycles, stats)
-
+    # train neural ode
+    odefunc, encoder, decoder = train_neural_ode(train_cycles, val_cycles)
 if __name__ == "__main__":
     main()
